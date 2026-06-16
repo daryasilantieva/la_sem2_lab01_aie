@@ -40,49 +40,38 @@ def tt_add(
         backend:  интерфейс backend
     """
     if tt1.shape != tt2.shape:
-        raise ValueError(f"формы не совпадают: {tt1.shape} != {tt2.shape}")
+        raise ValueError("TT tensors must have same shape")
     cores = []
     d = tt1.order
-    core1_data = []
-    r1_left, n1, r1_right = tt1.cores[0].shape
-    r2_left, n2, r2_right = tt2.cores[0].shape
-    new_r_right = r1_right + r2_right
-    for i in range(1):
-        for idx in range(n1):
-            for j in range(new_r_right):
-                if j < r1_right:
-                    core1_data.append(tt1.cores[0][i, idx, j])
-                else:
-                    core1_data.append(tt2.cores[0][i, idx, j - r1_right])
-    cores.append(DenseTensor((1, n1, new_r_right), data=core1_data))
-    for k in range(1, d - 1):
-        r1_left, n_k, r1_right = tt1.cores[k].shape
-        r2_left, n2, r2_right = tt2.cores[k].shape
-        new_r_left = r1_left + r2_left
-        new_r_right = r1_right + r2_right
-        core_data = []
-        for i in range(new_r_left):
-            for idx in range(n_k):
-                for j in range(new_r_right):
-                    if i < r1_left and j < r1_right:
-                        core_data.append(tt1.cores[k][i, idx, j])
-                    elif i >= r1_left and j >= r1_right:
-                        core_data.append(tt2.cores[k][i - r1_left, idx, j - r1_right])
-                    else:
-                        core_data.append(0.0)
-        cores.append(DenseTensor((new_r_left, n_k, new_r_right), data=core_data))
-    r1_left, n_d, r1_right = tt1.cores[-1].shape
-    r2_left, n2, r2_right = tt2.cores[-1].shape
-    new_r_left = r1_left + r2_left
-    core_data = []
-    for i in range(new_r_left):
-        for idx in range(n_d):
-            for j in range(1):
-                if i < r1_left:
-                    core_data.append(tt1.cores[-1][i, idx, 0])
-                else:
-                    core_data.append(tt2.cores[-1][i - r1_left, idx, 0])
-    cores.append(DenseTensor((new_r_left, n_d, 1), data=core_data))
+    for k in range(d):
+        core1 = tt1.cores[k]
+        core2 = tt2.cores[k]
+        r1_left, n, r1_right = core1.shape
+        r2_left, _, r2_right = core2.shape
+        if k == 0:
+            new_core = backend.zeros((1, n, r1_right + r2_right))
+            for i in range(n):
+                for a in range(r1_right):
+                    new_core[(0, i, a)] = core1[(0, i, a)]
+                for b in range(r2_right):
+                    new_core[(0, i, r1_right + b)] = core2[(0, i, b)]
+        elif k == d - 1:
+            new_core = backend.zeros((r1_left + r2_left, n, 1))
+            for i in range(n):
+                for a in range(r1_left):
+                    new_core[(a, i, 0)] = core1[(a, i, 0)]
+                for b in range(r2_left):
+                    new_core[(r1_left + b, i, 0)] = core2[(b, i, 0)]
+        else:
+            new_core = backend.zeros((r1_left + r2_left, n, r1_right + r2_right))
+            for i in range(n):
+                for a in range(r1_left):
+                    for b in range(r1_right):
+                        new_core[(a, i, b)] = core1[(a, i, b)]
+                for a in range(r2_left):
+                    for b in range(r2_right):
+                        new_core[(r1_left + a, i, r1_right + b)] = core2[(a, i, b)]
+        cores.append(new_core)
     return TTTensor(cores)
 
 
@@ -100,14 +89,10 @@ def tt_scalar_mul(
         alpha:   число
         backend: интерфейс backend
     """
+    if not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be number")
     cores = [core.copy() for core in tt.cores]
-    r_left, n, r_right = cores[0].shape
-    new_data = []
-    for i in range(r_left):
-        for idx in range(n):
-            for j in range(r_right):
-                new_data.append(cores[0][i, idx, j] * alpha)
-    cores[0] = DenseTensor((r_left, n, r_right), data=new_data)
+    cores[0] = backend.scale(cores[0], alpha)
     return TTTensor(cores)
 
 
@@ -124,22 +109,26 @@ def tt_hadamard(
         backend:  интерфейс backend
     """
     if tt1.shape != tt2.shape:
-        raise ValueError(f"формы не совпадают: {tt1.shape} != {tt2.shape}")
+        raise ValueError("TT tensors must have same shape")
     cores = []
-    d = tt1.order
-    for k in range(d):
-        r1_left, n_k, r1_right = tt1.cores[k].shape
-        r2_left, n2, r2_right = tt2.cores[k].shape
-        new_r_left = r1_left * r2_left
-        new_r_right = r1_right * r2_right
-        core_data = []
-        for i1 in range(r1_left):
-            for i2 in range(r2_left):
-                for idx in range(n_k):
-                    for j1 in range(r1_right):
-                        for j2 in range(r2_right):
-                            core_data.append(tt1.cores[k][i1, idx, j1] * tt2.cores[k][i2, idx, j2])
-        cores.append(DenseTensor((new_r_left, n_k, new_r_right), data=core_data))
+    for k in range(tt1.order):
+        core1 = tt1.cores[k]
+        core2 = tt2.cores[k]
+        r1_left, n, r1_right = core1.shape
+        r2_left, _, r2_right = core2.shape
+        new_core = backend.zeros((r1_left * r2_left, n, r1_right * r2_right))
+        for i in range(n):
+            for a1 in range(r1_left):
+                for a2 in range(r2_left):
+                    left_idx = a1 * r2_left + a2
+                    for b1 in range(r1_right):
+                        for b2 in range(r2_right):
+                            right_idx = b1 * r2_right + b2
+                            new_core[(left_idx, i, right_idx)] = (
+                                    core1[(a1, i, b1)] * core2[(a2, i, b2)]
+                            )
+        cores.append(new_core)
+
     return TTTensor(cores)
 
 
@@ -156,29 +145,25 @@ def tt_dot(
         backend:  интерфейс backend
     """
     if tt1.shape != tt2.shape:
-        raise ValueError(f"формы не совпадают: {tt1.shape} != {tt2.shape}")
-    d = tt1.order
-    r1_left, n1, r1_right = tt1.cores[0].shape
-    r2_left, n2, r2_right = tt2.cores[0].shape
-    Z = DenseTensor.zeros((r1_right, r2_right))
-    for idx in range(n1):
-        for i in range(r1_right):
-            for j in range(r2_right):
-                Z[i, j] += tt1.cores[0][0, idx, i] * tt2.cores[0][0, idx, j]
-    for k in range(1, d):
-        r1_left, n_k, r1_right = tt1.cores[k].shape
-        r2_left, n2, r2_right = tt2.cores[k].shape
-        new_Z = DenseTensor.zeros((r1_right, r2_right))
-        for idx in range(n_k):
-            for i in range(r1_left):
-                for j in range(r2_left):
-                    z_val = Z[i, j]
-                    if z_val != 0.0:
-                        for a in range(r1_right):
-                            for b in range(r2_right):
-                                new_Z[a, b] += tt1.cores[k][i, idx, a] * z_val * tt2.cores[k][j, idx, b]
-        Z = new_Z
-    return Z[0, 0]
+        raise ValueError("TT tensors must have same shape")
+    z = backend.ones((1, 1))
+    for k in range(tt1.order):
+        core1 = tt1.cores[k]
+        core2 = tt2.cores[k]
+        r1_left, n, r1_right = core1.shape
+        r2_left, _, r2_right = core2.shape
+        new_z = backend.zeros((r1_right, r2_right))
+        for i in range(n):
+            for a1 in range(r1_left):
+                for a2 in range(r2_left):
+                    z_val = z[(a1, a2)]
+                    for b1 in range(r1_right):
+                        for b2 in range(r2_right):
+                            new_z[(b1, b2)] = new_z[(b1, b2)] + (
+                                    core1[(a1, i, b1)] * z_val * core2[(a2, i, b2)]
+                            )
+        z = new_z
+    return z[(0, 0)]
 
 
 def tt_norm(
@@ -192,7 +177,10 @@ def tt_norm(
         tt:      TTTensor
         backend: интерфейс backend
     """
-    return math.sqrt(tt_dot(tt, tt, backend))
+    val = tt_dot(tt, tt, backend)
+    if val < 0 and abs(val) < 1e-10:
+        val = 0.0
+    return math.sqrt(val)
 
 
 def tt_diff_norm(
@@ -208,5 +196,7 @@ def tt_diff_norm(
         tt1, tt2: TTTensor
         backend:  интерфейс backend
     """
-    norm_sq = tt_dot(tt1, tt1, backend) + tt_dot(tt2, tt2, backend) - 2 * tt_dot(tt1, tt2, backend)
-    return math.sqrt(max(0.0, norm_sq))
+    diff = tt_add(tt1, tt_scalar_mul(tt2, -1, backend), backend)
+    return tt_norm(diff, backend)
+
+

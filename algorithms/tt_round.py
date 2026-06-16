@@ -27,63 +27,106 @@ def tt_round(
         max_rank: максимальный TT-ранг (None = без ограничения)
         eps:      относительная точность усечения
     """
-    tt_orth = right_canonicalize(tt, backend)
-    cores = [core.copy() for core in tt_orth.cores]
-    d = len(cores)
-    norm_g1 = 0.0
-    r_left, n, r_right = cores[0].shape
-    for i in range(r_left):
-        for idx in range(n):
-            for j in range(r_right):
-                norm_g1 += cores[0][i, idx, j] ** 2
-    norm_g1 = math.sqrt(norm_g1)
-    if d > 1 and norm_g1 > 1e-30:
-        delta = eps * norm_g1 / math.sqrt(d - 1)
+    if max_rank is not None:
+        if not isinstance(max_rank, int) or max_rank <= 0:
+            raise ValueError("max_rank must be positive integer or None")
+    if eps < 0:
+        raise ValueError("eps must be non-negative")
+    if tt.order == 1:
+        return tt.copy()
+    rounded = _right_orthogonalize_for_round(tt, backend)
+    cores = [core.copy() for core in rounded.cores]
+    first_norm = backend.norm(cores[0])
+    if first_norm > 1e-30:
+        delta = eps * first_norm / math.sqrt(tt.order - 1)
     else:
         delta = 0.0
-    for k in range(d - 1):
-        r_left, n_k, r_right = cores[k].shape
-
-        mat_data = []
-        for i in range(r_left):
-            for idx in range(n_k):
-                for j in range(r_right):
-                    mat_data.append(cores[k][i, idx, j])
-        mat = DenseTensor((r_left * n_k, r_right), data=mat_data)
-        U, S, Vt = backend.svd(mat)
-        new_r = _compute_rank(S, delta, max_rank)
-        if new_r == 0:
-            new_r = 1
-        U_trunc = _truncate_columns(U, new_r, backend)
-        core_data = []
-        for i in range(r_left):
-            for idx in range(n_k):
-                for j in range(new_r):
-                    core_data.append(U_trunc[i * n_k + idx, j])
-        cores[k] = DenseTensor((r_left, n_k, new_r), data=core_data)
-        S_trunc = [S[i] for i in range(new_r)]
-        Vt_trunc = _truncate_rows(Vt, new_r, backend)
-        SV_data = []
-        for i in range(new_r):
-            for j in range(Vt_trunc.shape[1]):
-                SV_data.append(S_trunc[i] * Vt_trunc[i, j])
-        SV = DenseTensor((new_r, Vt_trunc.shape[1]), data=SV_data)
-        next_r_left, next_n, next_r_right = cores[k + 1].shape
-        new_next_data = []
-        for i in range(new_r):
-            for idx in range(next_n):
-                for j in range(next_r_right):
-                    s = 0.0
-                    for p in range(r_right):
-                        s += SV[i, p] * cores[k + 1][p, idx, j]
-                    new_next_data.append(s)
-        cores[k + 1] = DenseTensor((new_r, next_n, next_r_right), data=new_next_data)
+    for k in range(tt.order - 1):
+        core = cores[k]
+        r_left, n, r_right = core.shape
+        matrix = backend.reshape(core, (r_left * n, r_right))
+        U, S, Vt = _safe_svd(matrix, backend)
+        rank = _compute_rank(S, delta, max_rank)
+        U_trunc = _truncate_columns(U, rank, backend)
+        S_trunc = _truncate_vector(S, rank, backend)
+        Vt_trunc = _truncate_rows(Vt, rank, backend)
+        cores[k] = backend.reshape(U_trunc, (r_left, n, rank))
+        rest = _multiply_diag_matrix(S_trunc, Vt_trunc, rank, backend)
+        next_core = cores[k + 1]
+        _, next_n, next_r = next_core.shape
+        new_next = backend.zeros((rank, next_n, next_r))
+        for a in range(rank):
+            for i in range(next_n):
+                for b in range(next_r):
+                    val = 0.0
+                    for c in range(r_right):
+                        val = val + rest[(a, c)] * next_core[(c, i, b)]
+                    new_next[(a, i, b)] = val
+        cores[k + 1] = new_next
     return TTTensor(cores)
 
 
 # ════════════════════════════════════════════════
 # Вспомогательные функции
 # ════════════════════════════════════════════════
+
+def _right_orthogonalize_for_round(tt: TTTensor, backend: BackendInterface) -> TTTensor:
+    """
+    Внутренняя правая ортогонализация для TT-round.
+    """
+    cores = [core.copy() for core in tt.cores]
+    for k in range(tt.order - 1, 0, -1):
+        core = cores[k]
+        r_left, n, r_right = core.shape
+        matrix = backend.reshape(core, (r_left, n * r_right))
+        U, S, Vt = _safe_svd(matrix, backend)
+        rank = S.shape[0]
+        U_trunc = _truncate_columns(U, rank, backend)
+        S_trunc = _truncate_vector(S, rank, backend)
+        Vt_trunc = _truncate_rows(Vt, rank, backend)
+        cores[k] = backend.reshape(Vt_trunc, (rank, n, r_right))
+        left_part = _multiply_columns_by_diag(U_trunc, S_trunc, backend)
+        prev_core = cores[k - 1]
+        prev_r_left, prev_n, _ = prev_core.shape
+        new_prev = backend.zeros((prev_r_left, prev_n, rank))
+        for a in range(prev_r_left):
+            for i in range(prev_n):
+                for b in range(rank):
+                    val = 0.0
+                    for c in range(r_left):
+                        val = val + prev_core[(a, i, c)] * left_part[(c, b)]
+                    new_prev[(a, i, b)] = val
+        cores[k - 1] = new_prev
+    return TTTensor(cores)
+
+
+def _safe_svd(matrix: DenseTensor, backend: BackendInterface) -> tuple[DenseTensor, DenseTensor, DenseTensor]:
+    """
+    SVD для любых матриц.
+    """
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-dimensional")
+    rows, cols = matrix.shape
+    if rows >= cols:
+        return backend.svd(matrix, full_matrices=False)
+    matrix_t = _transpose_matrix(matrix, backend)
+    U_t, S, Vt_t = backend.svd(matrix_t, full_matrices=False)
+    U = _transpose_matrix(Vt_t, backend)
+    Vt = _transpose_matrix(U_t, backend)
+    return U, S, Vt
+
+
+def _transpose_matrix(matrix: DenseTensor, backend: BackendInterface) -> DenseTensor:
+    """Возвращает транспонированную матрицу."""
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-dimensional")
+    rows, cols = matrix.shape
+    result = backend.zeros((cols, rows))
+    for i in range(rows):
+        for j in range(cols):
+            result[(j, i)] = matrix[(i, j)]
+    return result
+
 
 def _compute_rank(
     S: DenseTensor,
@@ -100,17 +143,28 @@ def _compute_rank(
         max_rank: максимально допустимый ранг (None = без ограничения)
     """
     if S.ndim != 1:
-        raise ValueError(f"S должен быть 1D, получен {S.ndim}D")
-    if S.size == 0:
-        return 0
-    rank = len(S.data)
-    for r in range(1, len(S.data) + 1):
-        discarded = sum(s * s for s in S.data[r:])
-        if discarded <= delta * delta:
-            rank = r
-            break
-    if max_rank is not None and rank > max_rank:
-        rank = max_rank
+        raise ValueError("S must be vector")
+    count = S.shape[0]
+    if count == 0:
+        return 1
+    border = max(1e-12, 1e-8 * abs(S[0]))
+    numerical_rank = 0
+    for i in range(count):
+        if abs(S[i]) > border:
+            numerical_rank = i + 1
+    if numerical_rank == 0:
+        numerical_rank = 1
+    rank = numerical_rank
+    if delta > 0:
+        tail_sum = 0.0
+        for i in range(numerical_rank - 1, 0, -1):
+            tail_sum = tail_sum + S[i] * S[i]
+            if tail_sum <= delta * delta:
+                rank = i
+            else:
+                break
+    if max_rank is not None:
+        rank = min(rank, max_rank)
     return max(1, rank)
 
 
@@ -128,15 +182,15 @@ def _truncate_columns(
         backend: интерфейс backend
     """
     if matrix.ndim != 2:
-        raise ValueError(f"matrix должен быть 2D, получен {matrix.ndim}D")
-    m, n = matrix.shape
-    if rank > n:
-        raise ValueError(f"rank={rank} > n={n}")
-    data = []
-    for i in range(m):
+        raise ValueError("matrix must be 2-dimensional")
+    rows, cols = matrix.shape
+    if rank < 1 or rank > cols:
+        raise ValueError("wrong rank")
+    result = backend.zeros((rows, rank))
+    for i in range(rows):
         for j in range(rank):
-            data.append(matrix[i, j])
-    return DenseTensor((m, rank), data=data)
+            result[(i, j)] = matrix[(i, j)]
+    return result
 
 
 def _truncate_rows(
@@ -153,15 +207,15 @@ def _truncate_rows(
         backend: интерфейс backend
     """
     if matrix.ndim != 2:
-        raise ValueError(f"matrix должен быть 2D, получен {matrix.ndim}D")
-    k, n = matrix.shape
-    if rank > k:
-        raise ValueError(f"rank={rank} > k={k}")
-    data = []
+        raise ValueError("matrix must be 2-dimensional")
+    rows, cols = matrix.shape
+    if rank < 1 or rank > rows:
+        raise ValueError("wrong rank")
+    result = backend.zeros((rank, cols))
     for i in range(rank):
-        for j in range(n):
-            data.append(matrix[i, j])
-    return DenseTensor((rank, n), data=data)
+        for j in range(cols):
+            result[(i, j)] = matrix[(i, j)]
+    return result
 
 
 def _truncate_vector(
@@ -178,10 +232,13 @@ def _truncate_vector(
         backend: интерфейс backend
     """
     if vector.ndim != 1:
-        raise ValueError(f"vector должен быть 1D, получен {vector.ndim}D")
-    if rank > vector.size:
-        raise ValueError(f"rank={rank} > size={vector.size}")
-    return DenseTensor((rank,), data=vector.data[:rank])
+        raise ValueError("vector must be 1-dimensional")
+    if rank < 1 or rank > vector.shape[0]:
+        raise ValueError("wrong rank")
+    result = backend.zeros((rank,))
+    for i in range(rank):
+        result[(i,)] = vector[(i,)]
+    return result
 
 
 def _multiply_diag_matrix(
@@ -201,16 +258,41 @@ def _multiply_diag_matrix(
         backend:  интерфейс backend
     """
     if diag_vec.ndim != 1:
-        raise ValueError(f"diag_vec должен быть 1D, получен {diag_vec.ndim}D")
+        raise ValueError("diag_vec must be vector")
     if matrix.ndim != 2:
-        raise ValueError(f"matrix должен быть 2D, получен {matrix.ndim}D")
-    if diag_vec.size != rank:
-        raise ValueError(f"diag_vec.size={diag_vec.size} != rank={rank}")
-    if matrix.shape[0] != rank:
-        raise ValueError(f"matrix.shape[0]={matrix.shape[0]} != rank={rank}")
-    m, n = matrix.shape
-    data = []
-    for i in range(m):
-        for j in range(n):
-            data.append(diag_vec[i] * matrix[i, j])
-    return DenseTensor((m, n), data=data)
+        raise ValueError("matrix must be 2-dimensional")
+    if diag_vec.shape[0] != rank or matrix.shape[0] != rank:
+        raise ValueError("wrong shapes")
+    cols = matrix.shape[1]
+    result = backend.zeros((rank, cols))
+    for i in range(rank):
+        diag_val = diag_vec[(i,)]
+        for j in range(cols):
+            result[(i, j)] = diag_val * matrix[(i, j)]
+    return result
+
+
+def _multiply_columns_by_diag(
+        matrix: DenseTensor,
+        diag_vec: DenseTensor,
+        backend: BackendInterface
+) -> DenseTensor:
+    """
+    Возвращает результат произведения обычной матрицы на диагональную:
+        matrix @ diag(diag_vec)
+    """
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-dimensional")
+    if diag_vec.ndim != 1:
+        raise ValueError("diag_vec must be vector")
+
+    rows, cols = matrix.shape
+    if cols != diag_vec.shape[0]:
+        raise ValueError("wrong shapes")
+
+    result = backend.zeros((rows, cols))
+    for i in range(rows):
+        for j in range(cols):
+            result[(i, j)] = matrix[(i, j)] * diag_vec[(j,)]
+    return result
+
