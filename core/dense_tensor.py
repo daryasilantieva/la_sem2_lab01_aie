@@ -121,9 +121,8 @@ class DenseTensor:
             nested: список
         """
 
-
         def get_shape(lst):
-            if not isinstance(lst, list):
+            if not isinstance(lst, (list, tuple)):
                 return ()
             if not lst:
                 return (0,)
@@ -132,9 +131,8 @@ class DenseTensor:
             shape.extend(sub_shape)
             return tuple(shape)
 
-
         def flatten(lst):
-            if not isinstance(lst, list):
+            if not isinstance(lst, (list, tuple)):
                 return [float(lst)]
             result = []
             for item in lst:
@@ -356,17 +354,20 @@ class DenseTensor:
         """Возвращает тензор в формате вложенного списка."""
         if self.ndim == 1:
             return self.data.copy()
-        result = []
-        for flat_idx in range(self.size):
-            multi = flat_to_multi_index(flat_idx, self.shape)
-            node = result
-            for i in range(self.ndim - 1):
-                idx = multi[i]
-                while len(node) <= idx:
-                    node.append([])
-                node = node[idx]
-            node.append(self.data[flat_idx])
-        return result
+
+        def build_nested(flat_idx, dim_idx):
+            if dim_idx == self.ndim - 1:
+                result = []
+                for i in range(self.shape[dim_idx]):
+                    multi = flat_to_multi_index(flat_idx + i * self.strides[dim_idx], self.shape)
+                    result.append(self.data[flat_idx + i * self.strides[dim_idx]])
+                return result
+            else:
+                result = []
+                for i in range(self.shape[dim_idx]):
+                    result.append(build_nested(flat_idx + i * self.strides[dim_idx], dim_idx + 1))
+                return result
+        return build_nested(0, 0)
 
     def __repr__(self) -> str:
         """

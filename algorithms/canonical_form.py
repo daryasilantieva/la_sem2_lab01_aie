@@ -69,15 +69,15 @@ def right_canonicalize(tt: TTTensor, backend: BackendInterface) -> TTTensor:
         mat = DenseTensor((r_left, n_k * r_right), data=mat_data)
         mat_t = backend.transpose(mat)
         Q_t, R_t = backend.qr(mat_t)
-        new_r = Q_t.shape[1]
+        new_r = r_left
         q_data = []
         for i in range(new_r):
             for idx in range(n_k):
                 for j in range(r_right):
                     q_data.append(Q_t[idx * n_k + j, i])
         cores[k] = DenseTensor((new_r, n_k, r_right), data=q_data)
-        prev_r_left, prev_n, prev_r_right = cores[k - 1].shape
         r_t = backend.transpose(R_t)
+        prev_r_left, prev_n, prev_r_right = cores[k - 1].shape
         new_prev_data = []
         for i in range(prev_r_left):
             for idx in range(prev_n):
@@ -114,7 +114,7 @@ def _numerical_rank(
     if S.ndim != 1:
         raise ValueError(f"S должен быть 1D, получен {S.ndim}D")
     if S.size == 0:
-        return 0
+        return 1
     max_s = max(S.data)
     threshold = max(abs_tol, rel_tol * max_s)
     rank = 0
@@ -123,7 +123,7 @@ def _numerical_rank(
             rank += 1
         else:
             break
-    return rank
+    return max(1, rank)
 
 
 def _truncate_columns(
